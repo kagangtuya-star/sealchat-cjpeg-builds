@@ -1,0 +1,399 @@
+name: Build and release standalone cjpeg
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LIBJPEG_TURBO_VERSION: "3.2.0"
+  LIBJPEG_TURBO_COMMIT: "c85e6b905bf237038faa936dab160ebfc5da0344"
+
+jobs:
+  linux:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout libjpeg-turbo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: libjpeg-turbo/libjpeg-turbo
+          ref: ${{ env.LIBJPEG_TURBO_COMMIT }}
+          path: src
+          persist-credentials: false
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            ninja-build \
+            musl-tools \
+            binutils \
+            file
+
+          if [[ "${{ matrix.arch }}" == "amd64" ]]; then
+            sudo apt-get install -y --no-install-recommends nasm
+          fi
+
+      - name: Verify pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          actual="$(git -C src rev-parse HEAD)"
+          expected="${{ env.LIBJPEG_TURBO_COMMIT }}"
+
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Unexpected libjpeg-turbo commit: $actual"
+            exit 1
+          fi
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake -S src -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=musl-gcc \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_STATIC=ON \
+            -DWITH_TOOLS=ON \
+            -DWITH_TESTS=OFF \
+            -DWITH_TURBOJPEG=OFF
+
+      - name: Build cjpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake --build build \
+            --target cjpeg-static \
+            --parallel
+
+          mkdir -p dist
+
+          install -m 0755 \
+            build/cjpeg-static \
+            dist/cjpeg
+
+          strip --strip-unneeded dist/cjpeg || true
+
+          cp src/LICENSE.md dist/
+          cp src/README.ijg dist/
+
+      - name: Verify standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file dist/cjpeg
+          ./dist/cjpeg -version
+
+          if readelf -l dist/cjpeg | grep -q 'INTERP'; then
+            echo "::error::cjpeg contains an ELF interpreter and is not fully static"
+            readelf -l dist/cjpeg
+            exit 1
+          fi
+
+          if readelf -d dist/cjpeg 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "::error::cjpeg has shared-library dependencies"
+            readelf -d dist/cjpeg
+            exit 1
+          fi
+
+          (
+            cd dist
+            sha256sum cjpeg > cjpeg.sha256
+          )
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="cjpeg-${{ env.LIBJPEG_TURBO_VERSION }}-${{ matrix.name }}.tar.gz"
+
+          tar \
+            -C dist \
+            -czf "$archive" \
+            cjpeg \
+            cjpeg.sha256 \
+            LICENSE.md \
+            README.ijg
+
+          test -s "$archive"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.name }}
+          path: cjpeg-${{ env.LIBJPEG_TURBO_VERSION }}-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+
+  windows:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            runner: windows-2025
+            cmake_arch: x64
+          - name: windows-arm64
+            runner: windows-11-vs2026-arm
+            cmake_arch: ARM64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout libjpeg-turbo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: libjpeg-turbo/libjpeg-turbo
+          ref: ${{ env.LIBJPEG_TURBO_COMMIT }}
+          path: src
+          persist-credentials: false
+
+      - name: Install NASM on x64
+        if: matrix.cmake_arch == 'x64'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm.exe -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+
+      - name: Verify pinned source
+        shell: pwsh
+        run: |
+          $actual = (git -C src rev-parse HEAD).Trim()
+          $expected = "${{ env.LIBJPEG_TURBO_COMMIT }}"
+
+          if ($actual -ne $expected) {
+            throw "Unexpected libjpeg-turbo commit: $actual"
+          }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake `
+            -S src `
+            -B build `
+            -A "${{ matrix.cmake_arch }}" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_STATIC=ON `
+            -DWITH_CRT_DLL=OFF `
+            -DWITH_TOOLS=ON `
+            -DWITH_TESTS=OFF `
+            -DWITH_TURBOJPEG=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build cjpeg
+        shell: pwsh
+        run: |
+          cmake `
+            --build build `
+            --config Release `
+            --target cjpeg-static `
+            --parallel
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          $candidates = @(
+            "build\Release\cjpeg-static.exe",
+            "build\cjpeg-static.exe"
+          )
+
+          $source = $null
+
+          foreach ($candidate in $candidates) {
+            if (Test-Path $candidate) {
+              $source = $candidate
+              break
+            }
+          }
+
+          if (-not $source) {
+            throw "cjpeg-static.exe was not produced"
+          }
+
+          Copy-Item $source "dist\cjpeg.exe"
+          Copy-Item "src\LICENSE.md" "dist\LICENSE.md"
+          Copy-Item "src\README.ijg" "dist\README.ijg"
+
+      - name: Smoke test and checksum
+        shell: pwsh
+        run: |
+          & ".\dist\cjpeg.exe" -version
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $hash = (
+            Get-FileHash `
+              ".\dist\cjpeg.exe" `
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          "$hash  cjpeg.exe" |
+            Set-Content `
+              ".\dist\cjpeg.exe.sha256" `
+              -Encoding ascii
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $archive = "cjpeg-${{ env.LIBJPEG_TURBO_VERSION }}-${{ matrix.name }}.zip"
+
+          Compress-Archive `
+            -Path `
+              "dist\cjpeg.exe", `
+              "dist\cjpeg.exe.sha256", `
+              "dist\LICENSE.md", `
+              "dist\README.ijg" `
+            -DestinationPath $archive `
+            -CompressionLevel Optimal
+
+          if (-not (Test-Path $archive)) {
+            throw "Release archive was not produced"
+          }
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.name }}
+          path: cjpeg-${{ env.LIBJPEG_TURBO_VERSION }}-${{ matrix.name }}.zip
+          if-no-files-found: error
+          compression-level: 0
+
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - linux
+      - windows
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify and generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=4
+          actual="$(find release-assets -maxdepth 1 -type f \
+            \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)"
+
+          if [[ "$actual" -ne "$expected" ]]; then
+            echo "::error::Expected $expected release archives, found $actual"
+            find release-assets -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum cjpeg-*.zip cjpeg-*.tar.gz > SHA256SUMS
+          )
+
+          cat release-assets/SHA256SUMS
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > release-assets/RELEASE_NOTES.md <<EOF
+          Standalone cjpeg builds for SealChat.
+
+          Upstream: libjpeg-turbo ${{ env.LIBJPEG_TURBO_VERSION }}
+          Commit: ${{ env.LIBJPEG_TURBO_COMMIT }}
+
+          Targets:
+          - Windows AMD64
+          - Windows ARM64
+          - Linux AMD64
+          - Linux ARM64
+
+          Linux binaries are built with musl and verified to contain no
+          PT_INTERP or DT_NEEDED entries.
+
+          Each platform archive contains the cjpeg binary, its SHA-256 checksum,
+          and the upstream libjpeg-turbo / IJG license files.
+
+          SHA256SUMS contains checksums for all four release archives.
+          EOF
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="cjpeg-${{ env.LIBJPEG_TURBO_VERSION }}"
+          title="cjpeg ${{ env.LIBJPEG_TURBO_VERSION }} for SealChat"
+
+          if gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes-file release-assets/RELEASE_NOTES.md
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file release-assets/RELEASE_NOTES.md
+          fi
+
+          gh release upload "$tag" \
+            release-assets/cjpeg-*.zip \
+            release-assets/cjpeg-*.tar.gz \
+            release-assets/SHA256SUMS \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
